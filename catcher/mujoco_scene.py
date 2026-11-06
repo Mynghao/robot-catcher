@@ -1,0 +1,347 @@
+"""MuJoCo scene: KUKA iiwa14 with a cup end-effector inside a room of panels.
+
+The ball is NOT simulated by MuJoCo here; its trajectory comes from the NumPy
+simulator (catcher.ball_sim) and is replayed through a mocap body. MuJoCo
+simulates the arm: a joint reference (IK + cubic, or differential IK) tracked by
+a computed-torque controller.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+import mujoco
+import numpy as np
+
+from .room import Room
+from .throws import Throw, in_catch_zone
+
+IIWA_XML = Path(__file__).resolve().parent.parent / "models" / "kuka_iiwa_14" / "iiwa14.xml"
+CUP_RADIUS = 0.07
+CUP_DEPTH = 0.08
+FLANGE_Z = 0.045  # link 7 flange (Menagerie "attachment_site")
+BALL_RADIUS = 0.035  # visual only; the simulator treats the ball as a point
+PANEL_THICKNESS = 0.02
+
+# KUKA LBR iiwa 14 R820 spec-sheet limits (the Menagerie model doesn't include them).
+VELOCITY_LIMITS = np.radians([85, 85, 100, 75, 130, 135, 135])
+TORQUE_LIMITS = np.array([320, 320, 176, 176, 110, 40, 40], dtype=float)
+
+# "Ready" posture: cup centered in the catch zone, opening tilted up toward the
+# thrower (+x). Incoming balls mostly descend, so this minimizes reorientation.
+Q_READY = np.array([0.0, 0.3, 0.0, -1.7, 0.0, -1.2, 0.0])
+
+_NOCONTACT = dict(contype=0, conaffinity=0)
+
+
+def _add_cup(body: mujoco.MjsBody, n_walls: int = 12):
+    """Open cup made of a bottom disc and a ring of thin box walls. Opening along link 7's +z."""
+    green = [0.1, 0.6, 0.3, 1.0]
+    z0 = FLANGE_Z + 0.005
+    body.add_geom(name="cup_bottom", type=mujoco.mjtGeom.mjGEOM_CYLINDER,
+                  size=[CUP_RADIUS, 0.002, 0], pos=[0, 0, z0], rgba=green, mass=0.05, **_NOCONTACT)
+    wall_w = 2 * CUP_RADIUS * np.tan(np.pi / n_walls) + 0.004
+    for i in range(n_walls):
+        a = 2 * np.pi * i / n_walls
+        body.add_geom(type=mujoco.mjtGeom.mjGEOM_BOX, size=[0.002, wall_w / 2, CUP_DEPTH / 2],
+                      pos=[CUP_RADIUS * np.cos(a), CUP_RADIUS * np.sin(a), z0 + CUP_DEPTH / 2],
+                      quat=[np.cos(a / 2), 0, 0, np.sin(a / 2)], rgba=[*green[:3], 0.9],
+                      mass=0.01, **_NOCONTACT)
+    body.add_site(name="cup_center", pos=[0, 0, z0 + CUP_DEPTH / 2])
+
+
+def _add_room(spec: mujoco.MjSpec, room: Room):
+    for panel in room.panels:
+        quat = np.zeros(4)
+        mujoco.mju_mat2Quat(quat, panel.rotation().flatten())
+        spec.worldbody.add_geom(name=panel.name, type=mujoco.mjtGeom.mjGEOM_BOX,
+                                size=[*panel.half_extents, PANEL_THICKNESS / 2], pos=panel.center,
+                                quat=quat, rgba=panel.material.rgba, **_NOCONTACT)
+
+
+def build_model(room: Room | None = None) -> mujoco.MjModel:
+    """iiwa14 (torque-controlled, no actuators) + cup, optional room, and a mocap ball."""
+    spec = mujoco.MjSpec.from_file(str(IIWA_XML))
+    for a in list(spec.actuators):  # drop Menagerie's position servos; we apply torques directly
+        spec.delete(a)
+    for k in list(spec.keys):
+        spec.delete(k)
+    spec.option.timestep = 1e-3
+    spec.option.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONTACT  # ball is kinematic; no arm contacts
+    spec.visual.global_.offwidth, spec.visual.global_.offheight = 960, 720
+    _add_cup(spec.body("link7"))
+    if room is not None:
+        _add_room(spec, room)
+    for light in list(spec.lights):  # Menagerie's tracking spotlight; replaced by room lighting
+        spec.delete(light)
+    spec.visual.headlight.ambient = [0.45, 0.45, 0.45]
+    spec.visual.headlight.diffuse = [0.5, 0.5, 0.5]
+    spec.worldbody.add_light(pos=[1.5, 0, 6], dir=[-0.2, 0.1, -1], diffuse=[0.5, 0.5, 0.5],
+                             type=mujoco.mjtLightType.mjLIGHT_DIRECTIONAL, castshadow=True)
+    ball = spec.worldbody.add_body(name="ball", mocap=True)
+    ball.add_geom(type=mujoco.mjtGeom.mjGEOM_SPHERE, size=[BALL_RADIUS, 0, 0],
+                  rgba=[1.0, 0.45, 0.0, 1.0], **_NOCONTACT)
+    return spec.compile()
+
+
+class Kinematics:
+    """Cup-center forward kinematics and Jacobians on a scratch MjData."""
+
+    def __init__(self, model: mujoco.MjModel):
+        self.model = model
+        self.data = mujoco.MjData(model)
+        self.site = model.site("cup_center").id
+        self.jacp = np.zeros((3, model.nv))
+        self.jacr = np.zeros((3, model.nv))
+
+    def __call__(self, q: np.ndarray):
+        """Returns cup center position, cup axis (opening direction), and the 6x7 Jacobian."""
+        self.data.qpos[:] = q
+        mujoco.mj_kinematics(self.model, self.data)
+        mujoco.mj_comPos(self.model, self.data)
+        mujoco.mj_jacSite(self.model, self.data, self.jacp, self.jacr, self.site)
+        R = self.data.site_xmat[self.site].reshape(3, 3)
+        return self.data.site_xpos[self.site].copy(), R[:, 2].copy(), np.vstack([self.jacp, self.jacr])
+
+
+def _cone_error(axis: np.ndarray, target_axis: np.ndarray, cone_rad: float):
+    """Rotation vector (perpendicular to the cup axis) that brings axis inside the cone, and the angle."""
+    angle = np.arccos(np.clip(axis.dot(target_axis), -1, 1))
+    c = np.cross(axis, target_axis)
+    if angle <= cone_rad or np.linalg.norm(c) < 1e-9:
+        return np.zeros(3), angle
+    return c / np.linalg.norm(c) * (angle - cone_rad), angle
+
+
+def _task_step(J: np.ndarray, err: np.ndarray, axis: np.ndarray, q: np.ndarray, q_nominal: np.ndarray,
+               damping: float = 0.05, centering: float = 0.1) -> np.ndarray:
+    """Damped least squares for position + the 2 rotations that tilt the cup axis
+    (spin about the axis is free), with null-space pull toward q_nominal."""
+    B = np.linalg.svd(axis[None, :])[2][1:]  # 2x3 basis orthogonal to the axis
+    Jt = np.vstack([J[:3], B @ J[3:]])
+    et = np.concatenate([err[:3], B @ err[3:]])
+    Jpinv = Jt.T @ np.linalg.inv(Jt @ Jt.T + damping**2 * np.eye(5))
+    return Jpinv @ et + (np.eye(len(q)) - Jpinv @ Jt) @ (centering * (q_nominal - q))
+
+
+def _solve_ik_from(kin: Kinematics, p_ball, target_axis, q_init, q_nominal, cone, iters, pos_tol):
+    lo, hi = kin.model.jnt_range.T
+    q = q_init.copy()
+    for _ in range(iters):
+        x, axis, J = kin(q)
+        rot_err, angle = _cone_error(axis, target_axis, cone)
+        pos_err = p_ball - x
+        if np.linalg.norm(pos_err) < pos_tol and angle <= cone + 1e-3:
+            return q, True
+        q = np.clip(q + _task_step(J, np.concatenate([pos_err, rot_err]), axis, q, q_nominal), lo, hi)
+    return q, False
+
+
+def solve_catch_ik(kin: Kinematics, p_ball: np.ndarray, v_ball: np.ndarray, q_guess: np.ndarray,
+                   cone_half_angle_deg: float, restarts: int = 0, iters: int = 200, pos_tol: float = 0.005):
+    """Joint config putting the cup center at the ball with its axis inside the
+    cone around -v_ball, staying close to q_guess. Returns (q, success).
+
+    The damped-least-squares IK is local; if it fails from q_guess, retry from
+    `restarts` random perturbations and keep the solution quickest to reach.
+    """
+    target_axis = -v_ball / np.linalg.norm(v_ball)
+    cone = np.radians(cone_half_angle_deg)
+    q, ok = _solve_ik_from(kin, p_ball, target_axis, q_guess, q_guess, cone, iters, pos_tol)
+    if ok or not restarts:
+        return q, ok
+    lo, hi = kin.model.jnt_range.T
+    rng = np.random.default_rng(0)
+    best = None
+    for _ in range(restarts):
+        q_init = np.clip(q_guess + rng.normal(0.0, 0.8, len(q_guess)), lo, hi)
+        q, ok = _solve_ik_from(kin, p_ball, target_axis, q_init, q_init, cone, iters, pos_tol)
+        if ok:
+            move_time = np.max(np.abs(q - q_guess) / VELOCITY_LIMITS)
+            if best is None or move_time < best[0]:
+                best = (move_time, q)
+    return (best[1], True) if best else (q, False)
+
+
+@dataclass
+class CubicTrajectory:
+    """Rest-to-rest joint-space cubic, as fast as the velocity limits allow."""
+
+    q0: np.ndarray
+    q1: np.ndarray
+
+    def __post_init__(self):
+        self.T = max(1.5 * np.max(np.abs(self.q1 - self.q0) / VELOCITY_LIMITS), 0.05)
+
+    def __call__(self, t: float):
+        s = np.clip(t / self.T, 0.0, 1.0)
+        dq = self.q1 - self.q0
+        moving = t < self.T
+        return (self.q0 + dq * (3 * s**2 - 2 * s**3),
+                dq * (6 * s - 6 * s**2) / self.T * moving,
+                dq * (6 - 12 * s) / self.T**2 * moving)
+
+
+class DiffIKReference:
+    """Differential IK toward a fixed catch target, re-solved every `dt`.
+
+    Commands a cup-center velocity toward the target and an axis rotation toward
+    the target direction, maps it through damped least squares, scales to respect
+    joint velocity limits, and integrates the joint reference.
+    """
+
+    def __init__(self, kin: Kinematics, p_target: np.ndarray, axis_target: np.ndarray, dt: float,
+                 gain: float = 20.0, max_speed: float = 3.0):
+        self.kin, self.p, self.a, self.dt = kin, p_target, axis_target, dt
+        self.gain, self.max_speed = gain, max_speed
+        self.lo, self.hi = kin.model.jnt_range.T
+        self.q, self.v, self.t_next = Q_READY.copy(), np.zeros(len(Q_READY)), 0.0
+
+    def __call__(self, t: float):
+        while t >= self.t_next:
+            x, axis, J = self.kin(self.q)
+            V = self.gain * (self.p - x)
+            speed = np.linalg.norm(V)
+            if speed > self.max_speed:
+                V *= self.max_speed / speed
+            w, _ = _cone_error(axis, self.a, 0.0)
+            v = _task_step(J, np.concatenate([V, self.gain * w]), axis, self.q, Q_READY)
+            v *= min(1.0, 1.0 / np.max(np.abs(v) / VELOCITY_LIMITS))
+            self.q = np.clip(self.q + v * self.dt, self.lo, self.hi)
+            self.v = v
+            self.t_next += self.dt
+        return self.q, self.v, np.zeros_like(self.q)
+
+
+def plan_ik_catch(kin: Kinematics, throw: Throw, cone_half_angle_deg: float,
+                  stride: int = 2, max_candidates: int = 40):
+    """Oracle catch plan: the earliest in-workspace ball sample the arm can reach
+    in time (or the least-late one if none). Returns (index, joint trajectory)."""
+    best = None
+    candidates = np.flatnonzero(in_catch_zone(throw.pos))[::stride][:max_candidates]
+    # Cheap pass from the ready pose first; random restarts only if nothing was reachable.
+    for restarts in (0, 8):
+        for k in candidates[::1 if restarts == 0 else 3]:
+            q, ok = solve_catch_ik(kin, throw.pos[k], throw.vel[k], Q_READY, cone_half_angle_deg, restarts)
+            if not ok:
+                continue
+            traj = CubicTrajectory(Q_READY, q)
+            slack = throw.times[k] - traj.T
+            if best is None or slack > best[0]:
+                best = (slack, int(k), traj)
+            if slack >= 0.05:
+                break
+        if best is not None:
+            break
+    if best is None:  # nothing reachable: hold the ready pose (counts as a miss)
+        return oracle_catch_index(throw), CubicTrajectory(Q_READY, Q_READY)
+    return best[1], best[2]
+
+
+def oracle_catch_index(throw: Throw, min_time: float = 0.35) -> int:
+    """Proposal's mean planner on ground truth: earliest in-workspace sample after a reaction time."""
+    ok = np.flatnonzero(in_catch_zone(throw.pos) & (throw.times >= min_time))
+    return int(ok[0]) if len(ok) else throw.catch_index
+
+
+@dataclass
+class CatchResult:
+    t_catch: float
+    p_ball: np.ndarray
+    p_cup_center: np.ndarray
+    position_error: float
+    axis_angle_deg: float  # angle between cup opening axis and -v_ball
+    success: bool
+    times: np.ndarray
+    q: np.ndarray  # (T, 7) logged joint positions
+    ball: np.ndarray  # (T, 3) ball position at the logged times
+
+
+def run_catch(throw: Throw, model: mujoco.MjModel | None = None, sim_time: float | None = None,
+              controller: str = "ik", ik_dt: float = 5e-3, log_dt: float = 1 / 60,
+              cone_half_angle_deg: float = 30.0, kp: float = 400.0) -> CatchResult:
+    """Simulate the arm moving to the oracle (ground-truth) catch target and score the catch.
+
+    controller="ik":     IK (with the cone constraint) once, then a joint-space cubic.
+    controller="diffik": differential IK toward a fixed catch pose, every ik_dt.
+    Both are tracked by a computed-torque controller on the simulated iiwa.
+    """
+    model = model or build_model(throw.room)
+    kin = Kinematics(model)
+    # Aim slightly inside the success cone to leave room for tracking error.
+    ik_cone_deg = cone_half_angle_deg - 5.0
+    if controller == "ik":
+        k, reference = plan_ik_catch(kin, throw, ik_cone_deg)
+    elif controller == "diffik":
+        k = oracle_catch_index(throw)
+    else:
+        raise ValueError(f"unknown controller {controller!r}")
+    t_c = float(throw.times[k])
+    p_ball, v_ball = throw.pos[k], throw.vel[k]
+    if controller == "diffik":
+        reference = DiffIKReference(kin, p_ball, -v_ball / np.linalg.norm(v_ball), ik_dt)
+    sim_time = sim_time if sim_time is not None else min(t_c + 0.5, float(throw.times[-1]))
+
+    data = mujoco.MjData(model)
+    data.qpos[:] = Q_READY
+    mujoco.mj_forward(model, data)
+    kd = 2 * np.sqrt(kp)
+    Mqdd = np.zeros(model.nv)
+    log_t, log_q = [], []
+    while data.time < sim_time:
+        if not log_t or data.time >= log_t[-1] + log_dt - 1e-9:
+            log_t.append(data.time)
+            log_q.append(data.qpos.copy())
+        mujoco.mj_step1(model, data)  # computes M and bias forces at the current state
+        q_ref, v_ref, a_ref = reference(data.time)
+        qdd = a_ref + kp * (q_ref - data.qpos) + kd * (v_ref - data.qvel)
+        mujoco.mj_mulM(model, data, Mqdd, qdd)
+        data.qfrc_applied[:] = np.clip(Mqdd + data.qfrc_bias, -TORQUE_LIMITS, TORQUE_LIMITS)
+        mujoco.mj_step2(model, data)
+    times, q = np.array(log_t), np.array(log_q)
+
+    # Score at t_c using the logged arm configuration closest in time.
+    p_cup_center, cup_axis, _ = kin(q[np.argmin(abs(times - t_c))])
+    err = float(np.linalg.norm(p_ball - p_cup_center))
+    angle = float(np.degrees(np.arccos(np.clip(cup_axis.dot(-v_ball / np.linalg.norm(v_ball)), -1, 1))))
+    success = err < CUP_RADIUS - BALL_RADIUS / 2 and angle < cone_half_angle_deg
+    ball, _ = throw.traj.sample(times)
+    return CatchResult(t_c, p_ball, p_cup_center, err, angle, success, times, q, ball)
+
+
+def default_camera() -> mujoco.MjvCamera:
+    cam = mujoco.MjvCamera()
+    cam.lookat[:] = [0.9, 0.0, 0.6]
+    cam.distance, cam.azimuth, cam.elevation = 3.6, -140.0, -18.0
+    return cam
+
+
+def add_path_to_scene(scene: mujoco.MjvScene, points: np.ndarray, rgba=(1.0, 0.45, 0.0, 0.5),
+                      width: float = 0.006):
+    """Draw a polyline (e.g. the ball path) as capsules into a scene's user geoms."""
+    for a, b in zip(points[:-1], points[1:]):
+        if scene.ngeom >= scene.maxgeom:
+            return
+        g = scene.geoms[scene.ngeom]
+        mujoco.mjv_initGeom(g, mujoco.mjtGeom.mjGEOM_CAPSULE, np.zeros(3), np.zeros(3), np.zeros(9),
+                            np.array(rgba, dtype=np.float32))
+        mujoco.mjv_connector(g, mujoco.mjtGeom.mjGEOM_CAPSULE, width, a, b)
+        scene.ngeom += 1
+
+
+def render_frames(model: mujoco.MjModel, result: CatchResult, path_points: np.ndarray,
+                  height: int = 480, width: int = 640) -> list[np.ndarray]:
+    """Offscreen-render the logged arm motion with the replayed ball."""
+    data = mujoco.MjData(model)
+    cam = default_camera()
+    frames = []
+    with mujoco.Renderer(model, height, width) as renderer:
+        for q, p in zip(result.q, result.ball):
+            data.qpos[:] = q
+            data.mocap_pos[0] = p
+            mujoco.mj_forward(model, data)
+            renderer.update_scene(data, camera=cam)
+            add_path_to_scene(renderer.scene, path_points[::3])
+            frames.append(renderer.render().copy())
+    return frames

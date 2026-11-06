@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bounce Lab</title>
+  <link rel="stylesheet" href="style.css">
+  <script type="importmap">{"imports": {"three": "./vendor/three.module.min.js"}}</script>
+</head>
+<body>
+  <aside id="config" aria-label="Simulation setup">
+    <header class="app-header">
+      <h1>Bounce Lab</h1>
+      <p>Set up a room, run the NumPy simulator, inspect the throws.</p>
+    </header>
+
+    <div id="config-scroll">
+      <section>
+        <h2>Geometry source</h2>
+        <label class="row">
+          <span>Source</span>
+          <select id="source">
+            <option value="custom">Custom room</option>
+            <option value="1">Stage 1: no bounces</option>
+            <option value="2">Stage 2: one board</option>
+            <option value="3">Stage 3: varied boards</option>
+            <option value="4">Stage 4: varied rooms</option>
+          </select>
+        </label>
+        <p class="hint" id="stage-hint" hidden>Each throw gets its own randomly generated room, as in the stage datasets.</p>
+      </section>
+
+      <div id="geometry"></div>
+
+      <section>
+        <h2>Throws</h2>
+        <label class="row" id="throw-mode-row">
+          <span>Mode</span>
+          <select id="throw-mode">
+            <option value="sample">Sampled throws</option>
+            <option value="manual">One manual throw</option>
+          </select>
+        </label>
+        <div id="throw-fields"></div>
+      </section>
+
+      <section>
+        <h2>Run settings</h2>
+        <div id="run-fields"></div>
+      </section>
+    </div>
+
+    <div class="run-bar">
+      <p id="error" role="alert" hidden></p>
+      <button id="run" class="primary">Run simulation</button>
+      <button id="reset" class="quiet">Reset all to defaults</button>
+    </div>
+  </aside>
+
+  <main id="view">
+    <canvas id="canvas" aria-label="3D view of the room and ball trajectory"></canvas>
+    <p id="view-message" hidden></p>
+    <ul id="legend">
+      <li><i class="dot" style="background:var(--ball)"></i>Ball</li>
+      <li><i class="line" style="background:var(--path)"></i>Trajectory</li>
+      <li><i class="dot small" style="background:var(--obs)"></i>Noisy observations</li>
+      <li><i class="dot ring"></i>Bounce</li>
+      <li><i class="diamond"></i>First catchable point</li>
+      <li><i class="dot" style="background:var(--zone)"></i>Catch zone</li>
+      <li><i class="box"></i>Throw region</li>
+      <li><i class="base"></i>Robot base (the arm isn't simulated here)</li>
+    </ul>
+    <button id="reset-view" class="overlay-button">Reset view</button>
+    <div id="transport" hidden>
+      <button id="play" class="icon" aria-label="Pause">❚❚</button>
+      <input id="scrub" type="range" min="0" max="1" step="0.001" value="0" aria-label="Playback time">
+      <output id="readout"></output>
+      <label class="compact">Speed
+        <select id="speed">
+          <option value="0.1">0.1×</option>
+          <option value="0.25">0.25×</option>
+          <option value="0.5">0.5×</option>
+          <option value="1" selected>1×</option>
+        </select>
+      </label>
+      <label class="compact" id="show-all-label"><input id="show-all" type="checkbox"> All throws</label>
+      <label class="compact"><input id="show-obs" type="checkbox" checked> Observations</label>
+    </div>
+  </main>
+
+  <aside id="results" aria-label="Results">
+    <div id="results-empty">
+      <h2>Results</h2>
+      <p class="hint">Press <b>Run simulation</b> to generate throws. They'll be listed here to play back and save as training data.</p>
+    </div>
+    <div id="results-body" hidden>
+      <section>
+        <h2 id="results-title"></h2>
+        <p class="hint" id="results-summary"></p>
+        <ol id="run-list"></ol>
+      </section>
+      <section id="run-detail"></section>
+      <section>
+        <h2>Save as training data</h2>
+        <label class="row"><span>File name</span><input id="save-name" type="text"></label>
+        <button id="save">Save these throws (.npz)</button>
+        <p class="hint" id="save-result" role="status"></p>
+      </section>
+    </div>
+  </aside>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
